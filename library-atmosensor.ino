@@ -148,7 +148,6 @@ void sendStatus() {
   msg += "Humidity: " + String(humidity, 1) + " %\n";
   msg += "Pressure: " + String(pressure, 0) + " hPa\n";
   msg += "Light: " + String(lux, 1) + " lx\n";
-  msg += "WiFi: " + String(WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
   bot.sendMessage(CHAT_ID, msg, "");
   ESP.wdtEnable(0);
 }
