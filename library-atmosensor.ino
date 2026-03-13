@@ -17,6 +17,7 @@
 #include <BH1750.h>            // BH1750 ambient light sensor
 #include "secrets.h"           // WiFi credentials, bot token, chat ID, device name
                                // secrets.h is gitignored — never committed to repo
+#include <user_interface.h>
 
 // Pull WiFi credentials from secrets.h into const char* variables
 // because WiFi.begin() expects const char* not #define strings
@@ -34,6 +35,18 @@ const char* password = WIFI_PASSWORD;
 #define LUX_CHANGE_THRESHOLD 5.0       // Lux delta required to wake screen
 #define ALERT_REPEAT_INTERVAL 300000   // Ms between repeated humidity alerts (5 min)
 #define ALERT_RESTART_INTERVAL 3600000 // Ms before alert cycle restarts after /hold (1 hour)
+
+// ============================================================
+// RTC MEMORY — persists across watchdog resets and WiFi drops
+// but clears on actual power loss. Used to track whether the
+// online message has already been sent this power cycle.
+// ============================================================
+struct RTCData {
+  uint32_t magic;
+  bool onlineSent;
+};
+RTCData rtcData;
+#define RTC_MAGIC 0xDEADBEEF
 
 // ============================================================
 // SENSOR AND DISPLAY OBJECTS
@@ -258,31 +271,33 @@ void handleHumidityLogic() {
 void setup() {
   Serial.begin(115200);
 
-  Wire.begin();          // Start I2C bus for BMP180 and BH1750
-  dht.begin();           // Start DHT11
-  bmp.begin();           // Start BMP180
-  lightMeter.begin();    // Start BH1750
-  u8g2.begin();          // Start OLED
-  u8g2.setPowerSave(0);  // Ensure display is on at boot
+  Wire.begin();
+  dht.begin();
+  bmp.begin();
+  lightMeter.begin();
+  u8g2.begin();
+  u8g2.setPowerSave(0);
 
-  // Start WiFi in station mode (connect to existing network)
-  // Does not block — WiFi connects in background while loop runs
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname(DEVICE_NAME); // Device shows up by name on your router
+  WiFi.setHostname(DEVICE_NAME);
   WiFi.begin(ssid, password);
-
-  // Sync time via NTP — required for valid SSL handshakes
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
-  // Configure HTTPS client for Telegram
-  // setInsecure() skips certificate validation — necessary on ESP8266
-  // setTimeout(6000) ensures SSL calls fail fast rather than hanging
-  // until the hardware watchdog fires and crashes the board
   client.setInsecure();
   client.setTimeout(6000);
 
-  screenTimeout = millis(); // Start the screen timeout timer
-  lastSwitch = millis();    // Start the label cycling timer
+  // Read RTC memory to check if online message was already sent
+  // this power cycle. If magic value doesn't match, this is a
+  // fresh power-on and we initialize the struct cleanly.
+  system_rtc_mem_read(64, &rtcData, sizeof(rtcData));
+  if (rtcData.magic != RTC_MAGIC) {
+    rtcData.magic = RTC_MAGIC;
+    rtcData.onlineSent = false;
+  }
+  botOnlineSent = rtcData.onlineSent;
+
+  screenTimeout = millis();
+  lastSwitch = millis();
 }
 
 // ============================================================
@@ -361,17 +376,19 @@ void loop() {
   // Step 6 — Run humidity alert state machine
   handleHumidityLogic();
 
-  // Step 7 — Send online message once when WiFi first connects
-  // Also resets alert state so a fresh humidity alert fires immediately
-  // rather than continuing a stale timer from before WiFi was up
+  // Step 7 - Send online message once per power cycle using RTC memory
+  // WiFi drops and watchdog resets will not trigger this again
+  // Only an actual power loss clears RTC memory
   if (!botOnlineSent && WiFi.status() == WL_CONNECTED) {
     ESP.wdtDisable();
     bot.sendMessage(CHAT_ID, String(DEVICE_NAME) + " online.", "");
     ESP.wdtEnable(0);
     botOnlineSent = true;
-    waitingForAck = false;  // Clear any stale alert state from pre-WiFi boot
+    rtcData.onlineSent = true;
+    system_rtc_mem_write(64, &rtcData, sizeof(rtcData));
+    waitingForAck = false;
     ackReceived = false;
-    lastAlertSent = 0;      // Force fresh alert trigger on next humidity check
+    lastAlertSent = 0;
   }
 
   // Step 8 — Poll Telegram for new messages every 10 seconds
