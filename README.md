@@ -34,9 +34,11 @@ An ESP8266-based environment monitor designed for 3D printing rooms and other sp
 - Display starts immediately on boot — no waiting for WiFi before readings appear
 
 ### WiFi and Bot Behavior
-The device does not wait for WiFi on boot. Sensors start reading and the display shows data immediately. WiFi connects in the background. Once connected, the bot sends an online notification automatically. If WiFi is unavailable the device continues functioning as a local display with no bot features until connectivity is restored.
+The device does not wait for WiFi on boot. Sensors start reading and the display shows data immediately. WiFi connects in the background. Once connected, the bot sends an online notification automatically. If WiFi is unavailable, the device continues functioning as a local display with no bot features until connectivity is restored.
 
-The `/status` response includes a WiFi field so you can tell at query time whether the device was online or offline.
+The OLED top strip shows the current WiFi connection icon. Telegram `/status` does not include a WiFi field because the device can only answer Telegram commands when it is already online.
+
+Telegram network calls are guarded by a WiFi check. Failed Telegram sends are not treated as successful alerts.
 
 ### Display Sleep / Wake — Light Sensor as a Switch
 
@@ -52,7 +54,7 @@ The BH1750 light sensor does double duty: it reads ambient lux as a sensor value
 **Why this matters:**
 In a room that goes completely dark overnight the display would otherwise stay on indefinitely burning the OLED. The light sensor lets the screen behave contextually — on when the room is in use, off when it isn't — without any extra hardware or buttons.
 
-The lux value is still displayed on screen and reported in `/status` as normal.
+The lux value is still displayed on screen and reported in `/status` as normal. If the BH1750 fails to initialize or returns an invalid reading, the display and `/status` show `ERR lx` instead of using a stale value.
 
 ### Telegram Bot
 All devices in the ecosystem share one bot. Commands broadcast to all devices or target a specific one by appending the device name.
@@ -68,15 +70,17 @@ All devices in the ecosystem share one bot. Commands broadcast to all devices or
 
 On boot each device sends: `[device name] online.`
 
+The sketch stores the last processed Telegram update ID in RTC memory. This prevents old `/hold` or `/stop` messages from being replayed after watchdog resets or WiFi reconnects. RTC memory survives watchdog resets and WiFi drops, but it clears on full power loss.
+
 ### Humidity Alerting
 A multi-stage alert system triggers when humidity exceeds the configured threshold (default 50%):
 
 1. **Humidity crosses threshold** — alert fires immediately with current reading and response instructions
 2. **No response** — alert repeats every **5 minutes** until `/hold` or `/stop` is sent
-3. **`/hold` sent** — repeating stops, a **1 hour hold** begins. If humidity is still high after the hour the full cycle restarts from step 1
+3. **`/hold` sent** — repeating stops, a **1 hour hold** begins. If humidity is still high after the hour, the full cycle restarts from step 1
 4. **`/stop` sent** — all alerts fully suppressed. System resets only after humidity drops below threshold naturally and then rises above it again — simulating a real fix followed by a new problem
 
-Only `/hold` and `/stop` affect the alert state. Sending `/status` or any other message does not accidentally acknowledge an alert.
+Only `/hold` and `/stop` affect the alert state. Sending `/status` or any other message does not accidentally acknowledge an alert. `/hold`, `/stop`, and the `/stop` low-humidity recovery marker are stored in RTC memory so they survive watchdog resets. If the device resets during a `/hold`, the hold window restarts conservatively from boot.
 
 ---
 
@@ -89,6 +93,14 @@ Reply /hold library to pause alerts for 1 hour.
 Reply /stop library to suppress alerts until humidity drops and recovers naturally.
 Reply /hold or /stop to suppress alerts ON ALL DEVICES.
 ```
+
+---
+
+## Sensor Error Handling
+
+The sketch checks for failed sensor reads before using the values. If DHT11 temperature or humidity returns `NaN`, the bad value is not used for display, `/status`, or humidity alert decisions. BMP180 and BH1750 initialization failures are also tracked. Invalid readings display as `ERR` with the relevant unit, such as `ERR %`, `ERR hPa`, or `ERR lx`.
+
+DHT11 and BMP180 readings are sampled every 2 seconds instead of every loop cycle. This avoids hammering the DHT11, reduces needless work, and keeps the display showing the most recent valid value between samples. BH1750 light sampling remains once per second for screen wake behavior.
 
 ---
 
@@ -115,6 +127,8 @@ Other configurable defines at the top of the sketch:
 | `LUX_CHANGE_THRESHOLD` | `5.0` | Lux delta required to wake screen |
 | `ALERT_REPEAT_INTERVAL` | `300000` | Ms between repeated humidity alerts (5 min) |
 | `ALERT_RESTART_INTERVAL` | `3600000` | Ms before alert cycle restarts after hold (1 hour) |
+| `SENSOR_READ_INTERVAL` | `2000` | Ms between DHT/BMP sensor reads |
+| `DISPLAY_REFRESH_INTERVAL` | `500` | Ms between OLED redraws |
 
 ---
 
@@ -172,6 +186,21 @@ Check the room immediately.
 | U8g2 | oliver |
 | UniversalTelegramBot | Brian Lough |
 | ArduinoJson | Benoit Blanchon |
+
+
+---
+
+## Memory and Performance Notes
+
+The ESP8266 build can report high IRAM usage because the board core reserves part of the instruction RAM area for flash instruction cache. If Arduino IDE reports IRAM close to the limit, use this board setting:
+
+```text
+Tools → MMU → 16KB cache + 48KB IRAM
+```
+
+That gives the sketch more IRAM headroom at the cost of a smaller flash instruction cache. For this sensor/alert project, that tradeoff is acceptable.
+
+The sketch also reduces runtime pressure by using smaller BearSSL buffers for Telegram HTTPS calls, reserving Telegram message `String` buffers before building messages, storing more fixed text with `F(...)`, reading the slower sensors on an interval, and redrawing the OLED every 500 ms instead of every loop cycle.
 
 ---
 

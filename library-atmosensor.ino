@@ -6,6 +6,7 @@
 // ============================================================
 
 #include <Arduino.h>
+#include <math.h>
 #include <U8g2lib.h>           // OLED display driver
 #include <Wire.h>              // I2C communication for BMP180 and BH1750
 #include <ESP8266WiFi.h>       // WiFi connection
@@ -35,18 +36,25 @@ const char* password = WIFI_PASSWORD;
 #define LUX_CHANGE_THRESHOLD 5.0       // Lux delta required to wake screen
 #define ALERT_REPEAT_INTERVAL 300000   // Ms between repeated humidity alerts (5 min)
 #define ALERT_RESTART_INTERVAL 3600000 // Ms before alert cycle restarts after /hold (1 hour)
+#define SENSOR_READ_INTERVAL 2000      // Ms between DHT/BMP sensor reads; DHT11 should not be polled rapidly
+#define DISPLAY_REFRESH_INTERVAL 500   // Ms between OLED redraws; avoids needless I2C work
 
 // ============================================================
 // RTC MEMORY — persists across watchdog resets and WiFi drops
-// but clears on actual power loss. Used to track whether the
-// online message has already been sent this power cycle.
+// but clears on actual power loss. Used to track online notification
+// state, the last processed Telegram update ID, and alert suppression
+// state so commands do not replay after a reset.
 // ============================================================
 struct RTCData {
   uint32_t magic;
   bool onlineSent;
+  long lastUpdateId;
+  bool holdActive;
+  bool stopSuppressed;
+  bool humidityWasLow;
 };
 RTCData rtcData;
-#define RTC_MAGIC 0xDEADBEEF
+#define RTC_MAGIC 0xA7105027
 
 // ============================================================
 // SENSOR AND DISPLAY OBJECTS
@@ -86,6 +94,8 @@ unsigned long lastBotCheck = 0;      // Last time bot was polled for messages
 unsigned long screenTimeout = 0;     // Timestamp of last screen wake event
 unsigned long lastAlertSent = 0;     // Timestamp of last humidity alert sent
 unsigned long ackReceivedTime = 0;   // Timestamp when /hold was received
+unsigned long lastSensorRead = 0;     // Last DHT/BMP sensor sample time
+unsigned long lastDisplayDraw = 0;    // Last OLED redraw time
 
 // ============================================================
 // STATE FLAGS
@@ -99,6 +109,12 @@ bool humidityWasLow = false;   // Tracks if humidity dipped below threshold afte
                                // Required to detect a full natural cycle before re-alerting
 bool botOnlineSent = false;    // Whether the startup online message has been sent
                                // Prevents sending it multiple times if WiFi reconnects
+bool dhtTempValid = false;     // Last DHT temperature read succeeded
+bool dhtHumidityValid = false; // Last DHT humidity read succeeded
+bool bmpValid = false;         // BMP180 initialized successfully
+bool bh1750Valid = false;      // BH1750 initialized successfully
+bool pressureValid = false;    // Last pressure read succeeded
+bool luxValid = false;         // Last lux read succeeded
 
 // ============================================================
 // SENSOR READINGS
@@ -110,54 +126,135 @@ float pressure = 0;
 float lux = 0;
 
 // Lux debounce variables — prevent screen flickering from sensor noise
-// prevLux: reading from two samples ago (used for change comparison)
-// lastLux: reading from one sample ago
+// lastLux: previous valid reading used for change comparison
+// luxSampleInitialized: prevents a false wake from the first sample after boot
 // lastLuxSample: timestamp to enforce 1 second between samples
 float lastLux = 0;
-float prevLux = 0;
+bool luxSampleInitialized = false;
 unsigned long lastLuxSample = 0;
+
+// Last processed Telegram update ID. Stored in RTC memory so old /hold
+// or /stop commands are not replayed after watchdog resets or reconnects.
+long lastProcessedUpdateId = 0;
+
+// ============================================================
+// TELEGRAM SEND HELPERS
+// All Telegram sends go through one WiFi check and one success check.
+// This prevents offline attempts from blocking local display behavior and
+// prevents failed sends from being treated as delivered alerts.
+// ============================================================
+bool telegramAvailable() {
+  return WiFi.status() == WL_CONNECTED;
+}
+
+bool sendTelegramMessage(const String& message) {
+  if (!telegramAvailable()) {
+    return false;
+  }
+
+  ESP.wdtDisable(); // Disable hardware watchdog — SSL can take too long otherwise
+  bool ok = bot.sendMessage(CHAT_ID, message, "");
+  ESP.wdtEnable(0); // Re-enable hardware watchdog
+
+  return ok;
+}
+
+void saveRtcData() {
+  system_rtc_mem_write(64, &rtcData, sizeof(rtcData));
+}
+
+void saveAlertState() {
+  rtcData.holdActive = ackReceived;
+  rtcData.stopSuppressed = stopSuppressed;
+  rtcData.humidityWasLow = humidityWasLow;
+  saveRtcData();
+}
+
+void rememberTelegramUpdate(long updateId) {
+  if (updateId <= lastProcessedUpdateId) {
+    return;
+  }
+
+  lastProcessedUpdateId = updateId;
+  bot.last_message_received = updateId;
+  rtcData.lastUpdateId = updateId;
+  saveRtcData();
+}
+
+void appendReadingOrError(String& msg, const __FlashStringHelper* label,
+                          float value, uint8_t precision,
+                          const char* unit, bool valid) {
+  msg += label;
+  if (valid) {
+    msg += String(value, precision);
+    msg += ' ';
+    msg += unit;
+  } else {
+    msg += F("ERR ");
+    msg += unit;
+  }
+  msg += '\n';
+}
 
 // ============================================================
 // SEND HUMIDITY ALERT
 // Fires when humidity crosses threshold, repeats every 5 min
-// until /hold or /stop is received
-// ESP.wdtDisable/Enable wraps all Telegram calls because the
-// SSL handshake can take longer than the hardware watchdog allows
+// until /hold or /stop is received. Returns true only if Telegram
+// accepted the message.
 // ============================================================
-void sendHumidityAlert() {
-  ESP.wdtDisable(); // Disable hardware watchdog — SSL takes too long otherwise
-  String alert = "⚠️ " + String(DEVICE_NAME) + " humidity at " + String(humidity, 1) + "%\n\n";
-  alert += "Reply /hold " + String(DEVICE_NAME) + " to pause alerts for 1 hour.\n";
-  alert += "Reply /stop " + String(DEVICE_NAME) + " to suppress alerts until humidity drops and recovers naturally.\n";
-  alert += "Reply /hold or /stop to suppress alerts ON ALL DEVICES until humidity drops and recovers naturally.";
-  bot.sendMessage(CHAT_ID, alert, "");
-  ESP.wdtEnable(0); // Re-enable hardware watchdog
-  lastAlertSent = millis(); // Record when this alert was sent for repeat timer
-  waitingForAck = true;     // Mark that we're waiting for a response
+bool sendHumidityAlert() {
+  if (!dhtHumidityValid) {
+    return false;
+  }
+
+String alert;
+alert.reserve(360);
+alert += F("⚠️ ");
+alert += DEVICE_NAME;
+alert += F(" humidity at ");
+alert += String(humidity, 1);
+alert += F("%\n\n");
+alert += F("Reply /hold ");
+alert += DEVICE_NAME;
+alert += F(" to pause alerts for 1 hour.\n");
+alert += F("Reply /stop ");
+alert += DEVICE_NAME;
+alert += F(" to suppress alerts until humidity drops and recovers naturally.\n");
+alert += F("Reply /status to review sensors.\n");
+alert += F("Reply /hold or /stop to suppress alerts ON ALL DEVICES.");
+
+  bool ok = sendTelegramMessage(alert);
+  if (ok) {
+    lastAlertSent = millis(); // Record when this alert was actually sent
+    waitingForAck = true;     // Mark that we're waiting for a response
+  }
+
+  return ok;
 }
 
 // ============================================================
 // SEND STATUS
-// Returns all four sensor readings plus WiFi state
-// Triggered by /status or /status [device] command
+// Returns all available sensor readings. Triggered by
+// /status or /status [device] command.
 // ============================================================
 void sendStatus() {
-  ESP.wdtDisable();
-  String msg = String(DEVICE_NAME) + " status:\n";
-  msg += "Temp: " + String(tempF, 1) + " F\n";
-  msg += "Humidity: " + String(humidity, 1) + " %\n";
-  msg += "Pressure: " + String(pressure, 0) + " hPa\n";
-  msg += "Light: " + String(lux, 1) + " lx\n";
-  bot.sendMessage(CHAT_ID, msg, "");
-  ESP.wdtEnable(0);
+  String msg;
+  msg.reserve(128);
+  msg += DEVICE_NAME;
+  msg += F(" status:\n");
+  appendReadingOrError(msg, F("Temp: "), tempF, 1, "F", dhtTempValid);
+  appendReadingOrError(msg, F("Humidity: "), humidity, 1, "%", dhtHumidityValid);
+  appendReadingOrError(msg, F("Pressure: "), pressure, 0, "hPa", pressureValid);
+  appendReadingOrError(msg, F("Light: "), lux, 1, "lx", luxValid);
+  sendTelegramMessage(msg);
 }
 
 // ============================================================
 // HANDLE INCOMING MESSAGES
-// Parses command and optional device target from message text
-// Commands with no target broadcast to all devices
-// Commands with a target only affect the matching device
-// Example: "/hold" affects all, "/hold library" affects only library
+// Parses command and optional device target from message text.
+// Commands with no target broadcast to all devices.
+// Commands with a target only affect the matching device.
+// Example: "/hold" affects all, "/hold library" affects only library.
 // ============================================================
 void handleMessages(int numMessages) {
   Serial.print("Got ");
@@ -165,7 +262,19 @@ void handleMessages(int numMessages) {
   Serial.println(" messages");
 
   for (int i = 0; i < numMessages; i++) {
+    long updateId = bot.messages[i].update_id;
+
+    // Avoid replaying already handled Telegram updates. This matters after
+    // watchdog resets because bot.last_message_received normally lives only
+    // in RAM.
+    if (updateId <= lastProcessedUpdateId) {
+      Serial.print("Skipping duplicate update: ");
+      Serial.println(updateId);
+      continue;
+    }
+
     String text = bot.messages[i].text;
+    text.trim();
     Serial.print("Message: ");
     Serial.println(text);
 
@@ -178,24 +287,37 @@ void handleMessages(int numMessages) {
     if (spaceIndex != -1) {
       command = text.substring(0, spaceIndex);
       target = text.substring(spaceIndex + 1);
+      target.trim();
       target.toLowerCase(); // Normalize to lowercase for comparison
     }
+    command.toLowerCase();
 
     // isForMe is true if no target was specified (broadcast)
     // or if the target matches this device's DEVICE_NAME
     bool isForMe = (target == "" || target == DEVICE_NAME);
 
-    // /status or /library — return all sensor readings
-    if ((command == "/status" || command == "/library") && isForMe) {
+    // /status — return all sensor readings
+    if (command == "/status" && isForMe) {
+      rememberTelegramUpdate(updateId);
       sendStatus();
+      continue;
     }
 
     // /hold — pause alerts for 1 hour then restart cycle
     if (command == "/hold" && isForMe) {
       waitingForAck = false;
       ackReceived = true;
+      stopSuppressed = false;
+      humidityWasLow = false;
       ackReceivedTime = millis(); // Start the 1 hour hold timer
-      bot.sendMessage(CHAT_ID, String(DEVICE_NAME) + " humidity alerts paused for 1 hour.", "");
+      saveAlertState();
+      rememberTelegramUpdate(updateId);
+      String reply;
+      reply.reserve(64);
+      reply += DEVICE_NAME;
+      reply += F(" humidity alerts paused for 1 hour.");
+      sendTelegramMessage(reply);
+      continue;
     }
 
     // /stop — fully suppress alerts until humidity naturally cycles
@@ -206,9 +328,19 @@ void handleMessages(int numMessages) {
       waitingForAck = false;
       ackReceived = false;
       humidityWasLow = false; // Reset the natural cycle tracker
-      bot.sendMessage(CHAT_ID, String(DEVICE_NAME) + " humidity alerts suppressed until humidity drops and rises again.", "");
+      saveAlertState();
+      rememberTelegramUpdate(updateId);
+      String reply;
+      reply.reserve(96);
+      reply += DEVICE_NAME;
+      reply += F(" humidity alerts suppressed until humidity drops and rises again.");
+      sendTelegramMessage(reply);
       continue;
     }
+
+    // Unknown or non-targeted commands are still consumed so they do not
+    // replay forever after a reset.
+    rememberTelegramUpdate(updateId);
   }
 }
 
@@ -216,9 +348,13 @@ void handleMessages(int numMessages) {
 // HUMIDITY ALERT STATE MACHINE
 // Called every loop cycle. Manages the full alert lifecycle:
 // fresh alert → repeat every 5 min → /hold pauses 1 hour →
-// restart after 1 hour → /stop suppresses until natural cycle
+// restart after 1 hour → /stop suppresses until natural cycle.
 // ============================================================
 void handleHumidityLogic() {
+  if (!dhtHumidityValid) {
+    return;
+  }
+
   if (humidity > HUMIDITY_THRESHOLD) {
 
     // /stop was sent — do nothing until humidity naturally cycles
@@ -226,10 +362,17 @@ void handleHumidityLogic() {
       return;
     }
 
+    // No Telegram work while WiFi is unavailable. The device remains a local
+    // monitor and will alert when WiFi returns if humidity is still high.
+    if (!telegramAvailable()) {
+      return;
+    }
+
     // /hold was received — wait 1 hour then restart the alert cycle
     if (ackReceived) {
       if (millis() - ackReceivedTime >= ALERT_RESTART_INTERVAL) {
         ackReceived = false;    // Clear hold state
+        saveAlertState();
         sendHumidityAlert();    // Restart the cycle with a fresh alert
       }
       return;
@@ -251,13 +394,17 @@ void handleHumidityLogic() {
 
     // If /stop is active, track that humidity went low
     // This is required before alerts can restart after /stop
-    if (stopSuppressed) {
+    if (stopSuppressed && !humidityWasLow) {
       humidityWasLow = true;
+      saveAlertState();
     }
 
     // Clear alert state — fresh start when humidity rises again
     waitingForAck = false;
-    ackReceived = false;
+    if (ackReceived) {
+      ackReceived = false;
+      saveAlertState();
+    }
   }
 }
 
@@ -272,8 +419,8 @@ void setup() {
 
   Wire.begin();
   dht.begin();
-  bmp.begin();
-  lightMeter.begin();
+  bmpValid = bmp.begin();
+  bh1750Valid = lightMeter.begin();
   u8g2.begin();
   u8g2.setPowerSave(0);
 
@@ -283,6 +430,7 @@ void setup() {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
   client.setInsecure();
+  client.setBufferSizes(512, 512); // Smaller BearSSL buffers reduce heap pressure during Telegram HTTPS calls
   client.setTimeout(6000);
 
   // Read RTC memory to check if online message was already sent
@@ -292,8 +440,20 @@ void setup() {
   if (rtcData.magic != RTC_MAGIC) {
     rtcData.magic = RTC_MAGIC;
     rtcData.onlineSent = false;
+    rtcData.lastUpdateId = 0;
+    rtcData.holdActive = false;
+    rtcData.stopSuppressed = false;
+    rtcData.humidityWasLow = false;
   }
   botOnlineSent = rtcData.onlineSent;
+  lastProcessedUpdateId = rtcData.lastUpdateId;
+  bot.last_message_received = rtcData.lastUpdateId;
+  ackReceived = rtcData.holdActive;
+  if (ackReceived) {
+    ackReceivedTime = millis(); // Conservative reset behavior: restart remaining hold window
+  }
+  stopSuppressed = rtcData.stopSuppressed;
+  humidityWasLow = rtcData.humidityWasLow;
 
   screenTimeout = millis();
   lastSwitch = millis();
@@ -321,37 +481,76 @@ void loop() {
     lastSwitch = millis();
   }
 
-  // Step 2 — Read sensors
-  tempF = (dht.readTemperature() * 9.0 / 5.0) + 32.0; // Celsius to Fahrenheit
-  humidity = dht.readHumidity();
-  pressure = bmp.readPressure() / 100.0; // Pa to hPa
+  // Step 2 — Read DHT/BMP sensors on an interval
+  // DHT11 is slow and should not be polled every loop. The display keeps
+  // showing the most recent valid reading between samples.
+  if (lastSensorRead == 0 || millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
+    lastSensorRead = millis();
+
+    float tempC = dht.readTemperature();
+    float humidityReading = dht.readHumidity();
+
+    if (!isnan(tempC)) {
+      tempF = (tempC * 9.0 / 5.0) + 32.0; // Celsius to Fahrenheit
+      dhtTempValid = true;
+    } else {
+      dhtTempValid = false;
+    }
+
+    if (!isnan(humidityReading)) {
+      humidity = humidityReading;
+      dhtHumidityValid = true;
+    } else {
+      dhtHumidityValid = false;
+    }
+
+    if (bmpValid) {
+      pressure = bmp.readPressure() / 100.0; // Pa to hPa
+      pressureValid = true;
+    } else {
+      pressureValid = false;
+    }
+  }
 
   // Step 3 — Lux sampling and screen wake logic
   // Sampled once per second to prevent sensor noise from
-  // constantly triggering screen wakes and flickering
-  // Two consecutive readings are compared (prevLux vs currentLux)
-  // to require a real sustained change rather than a momentary spike
+  // constantly triggering screen wakes and flickering. Consecutive
+  // valid readings are compared directly.
   if (millis() - lastLuxSample > 1000) {
-    float currentLux = lightMeter.readLightLevel();
-    lux = currentLux; // Update global for display and status
+    if (bh1750Valid) {
+      float currentLux = lightMeter.readLightLevel();
 
-    // Wake condition 1: significant lux change (lights on or off)
-    bool bigChange = abs(currentLux - prevLux) >= LUX_CHANGE_THRESHOLD;
+      if (!isnan(currentLux) && currentLux >= 0.0) {
+        lux = currentLux; // Update global for display and status
+        luxValid = true;
 
-    // Wake condition 2: deliberate cover gesture
-    // Sensor drops from above 1 lux to below 1 lux
-    // Works even in a dim room where absolute change would be small
-    bool coverDrop = (currentLux < 1.0 && prevLux >= 1.0);
+        if (luxSampleInitialized) {
+          // Wake condition 1: significant lux change (lights on or off)
+          bool bigChange = fabs(currentLux - lastLux) >= LUX_CHANGE_THRESHOLD;
 
-    if (bigChange || coverDrop) {
-      u8g2.setPowerSave(0); // Wake display
-      screenOn = true;
-      screenTimeout = millis(); // Reset the 5 minute timer
+          // Wake condition 2: deliberate cover gesture
+          // Sensor drops from above 1 lux to below 1 lux
+          // Works even in a dim room where absolute change would be small
+          bool coverDrop = (currentLux < 1.0 && lastLux >= 1.0);
+
+          if (bigChange || coverDrop) {
+            u8g2.setPowerSave(0); // Wake display
+            screenOn = true;
+            lastDisplayDraw = 0; // Force redraw soon after wake
+            screenTimeout = millis(); // Reset the 5 minute timer
+          }
+        } else {
+          luxSampleInitialized = true;
+        }
+
+        lastLux = currentLux;
+      } else {
+        luxValid = false;
+      }
+    } else {
+      luxValid = false;
     }
 
-    // Shift readings forward for next comparison
-    prevLux = lastLux;
-    lastLux = currentLux;
     lastLuxSample = millis();
   }
 
@@ -365,11 +564,13 @@ void loop() {
   // After /stop, alerts only restart when humidity has dropped
   // below threshold (humidityWasLow = true) AND risen above it again
   // This simulates: problem fixed → room dried out → problem returned
-  if (stopSuppressed && humidityWasLow && humidity > HUMIDITY_THRESHOLD) {
+  if (stopSuppressed && humidityWasLow && dhtHumidityValid && humidity > HUMIDITY_THRESHOLD) {
     stopSuppressed = false;
     humidityWasLow = false;
-    sendHumidityAlert(); // Fresh alert — new problem detected
-    return;
+    waitingForAck = false;
+    ackReceived = false;
+    saveAlertState();
+    // Let the normal state machine send the fresh alert if WiFi is available.
   }
 
   // Step 6 — Run humidity alert state machine
@@ -378,40 +579,58 @@ void loop() {
   // Step 7 - Send online message once per power cycle using RTC memory
   // WiFi drops and watchdog resets will not trigger this again
   // Only an actual power loss clears RTC memory
-  if (!botOnlineSent && WiFi.status() == WL_CONNECTED) {
-    ESP.wdtDisable();
-    bot.sendMessage(CHAT_ID, String(DEVICE_NAME) + " online.", "");
-    ESP.wdtEnable(0);
-    botOnlineSent = true;
-    rtcData.onlineSent = true;
-    system_rtc_mem_write(64, &rtcData, sizeof(rtcData));
-    waitingForAck = false;
-    ackReceived = false;
-    lastAlertSent = 0;
+  if (!botOnlineSent && telegramAvailable()) {
+    String onlineMsg;
+    onlineMsg.reserve(32);
+    onlineMsg += DEVICE_NAME;
+    onlineMsg += F(" online.");
+    bool onlineSent = sendTelegramMessage(onlineMsg);
+    if (onlineSent) {
+      botOnlineSent = true;
+      rtcData.onlineSent = true;
+      saveRtcData();
+    }
   }
 
   // Step 8 — Poll Telegram for new messages every 10 seconds
   // wdtDisable/Enable wraps the entire block because getUpdates
   // makes an SSL call that can exceed the hardware watchdog timeout
-  if (millis() - lastBotCheck > 10000) {
+  if (telegramAvailable() && millis() - lastBotCheck > 10000) {
     ESP.wdtDisable();
-    int numMessages = bot.getUpdates(bot.last_message_received + 1);
+    int numMessages = bot.getUpdates(lastProcessedUpdateId + 1);
+    ESP.wdtEnable(0);
+
     // Drain all queued messages before moving on
     while (numMessages) {
       handleMessages(numMessages);
-      numMessages = bot.getUpdates(bot.last_message_received + 1);
+
+      ESP.wdtDisable();
+      numMessages = bot.getUpdates(lastProcessedUpdateId + 1);
+      ESP.wdtEnable(0);
     }
-    ESP.wdtEnable(0);
+
     lastBotCheck = millis();
   }
 
   // Step 9 — Build value string for current label
-  char valueStr[16];
+  char valueStr[24];
   switch (labelIndex) {
-    case 0: dtostrf(tempF, 4, 1, valueStr); strcat(valueStr, " F"); break;
-    case 1: dtostrf(humidity, 4, 1, valueStr); strcat(valueStr, " %"); break;
-    case 2: dtostrf(lux, 4, 1, valueStr); strcat(valueStr, " lx"); break;
-    case 3: dtostrf(pressure, 5, 0, valueStr); strcat(valueStr, " hPa"); break;
+    case 0:
+      if (dhtTempValid) { dtostrf(tempF, 4, 1, valueStr); strcat(valueStr, " F"); }
+      else { strcpy(valueStr, "ERR F"); }
+      break;
+    case 1:
+      if (dhtHumidityValid) { dtostrf(humidity, 4, 1, valueStr); strcat(valueStr, " %"); }
+      else { strcpy(valueStr, "ERR %"); }
+      break;
+    case 2:
+      if (luxValid) { dtostrf(lux, 4, 1, valueStr); strcat(valueStr, " lx"); }
+      else { strcpy(valueStr, "ERR lx"); }
+      break;
+    case 3:
+      if (pressureValid) { dtostrf(pressure, 5, 0, valueStr); strcat(valueStr, " hPa"); }
+      else { strcpy(valueStr, "ERR hPa"); }
+      break;
   }
 
   bool connected = (WiFi.status() == WL_CONNECTED);
@@ -419,7 +638,8 @@ void loop() {
   // Step 9 cont. — Render display only if screen is on
   // Top yellow strip (16px): WiFi icon + sensor label
   // Bottom blue area (48px): Large sensor value
-  if (screenOn) {
+  if (screenOn && (lastDisplayDraw == 0 || millis() - lastDisplayDraw >= DISPLAY_REFRESH_INTERVAL)) {
+    lastDisplayDraw = millis();
     u8g2.clearBuffer();
 
     // WiFi icon — glyph 0x0051 = connected, 0x0050 = disconnected
